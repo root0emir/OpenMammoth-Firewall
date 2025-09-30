@@ -1,0 +1,605 @@
+#!/bin/bash
+
+#################################################################################
+# OpenMammoth Firewall - Firewall with iptables
+# Developer: root0emir
+#
+# Copyright (C) 2025 root0emir
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#################################################################################
+
+# Colors and formatting
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' 
+
+# Log files
+LOG_FILE="/var/log/openmammoth-firewall.log"
+FIREWALL_LOG_ENABLED=true
+
+# Banner display
+show_banner() {
+    clear
+    echo -e "${PURPLE}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${PURPLE}║                                                                  ║${NC}"
+    echo -e "${PURPLE}║${WHITE}      O P E N  M A M M O T H  F I R E W A L L    ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║                                                                  ║${NC}"
+    echo -e "${PURPLE}║${CYAN}            Developed by root0emir                ${PURPLE}║${NC}"
+    echo -e "${PURPLE}║                                                                  ║${NC}"
+    echo -e "${PURPLE}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# Log function
+log_message() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $message" >> "$LOG_FILE"
+}
+
+# Root check
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Error: This script must be run with root privileges!${NC}"
+        echo -e "${YELLOW}Please run with 'sudo openmammoth-firewall'${NC}"
+        exit 1
+    fi
+}
+
+# Enable firewall logging
+enable_firewall_logs() {
+    echo -e "${CYAN}Enabling detailed firewall logging...${NC}"
+    log_message "Firewall logging enabled"
+    
+    # Enable kernel logging for dropped packets
+    echo 1 > /proc/sys/net/netfilter/nf_log_all_netns 2>/dev/null
+    
+    # Set log level
+    echo 4 > /proc/sys/kernel/printk 2>/dev/null
+    
+    FIREWALL_LOG_ENABLED=true
+    echo -e "${GREEN}Firewall logging has been enabled.${NC}"
+    echo -e "${WHITE}Logs will be written to: $LOG_FILE${NC}"
+    echo -e "${WHITE}Kernel logs available in: /var/log/kern.log or /var/log/messages${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Disable firewall logging
+disable_firewall_logs() {
+    echo -e "${YELLOW}Disabling firewall logging...${NC}"
+    log_message "Firewall logging disabled"
+    
+    # Remove logging rules
+    iptables -D INPUT -j LOG --log-prefix "OM-FW-DROPPED: " --log-level 4 -m limit --limit 5/min 2>/dev/null
+    iptables -D INPUT -m conntrack --ctstate INVALID -j LOG --log-prefix "Invalid Packet: " 2>/dev/null
+    iptables -D INPUT -m recent --name portscan --set -j LOG --log-prefix "Portscan:" 2>/dev/null
+    iptables -D FORWARD -m recent --name portscan --set -j LOG --log-prefix "Portscan:" 2>/dev/null
+    
+    FIREWALL_LOG_ENABLED=false
+    echo -e "${GREEN}Firewall logging has been disabled.${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Tor control - Layered approach - checking tor / vpn because om firewall can break tor routing and vpn 
+check_tor_usage() {
+    echo -e "${YELLOW}Checking for Tor network traffic...${NC}"
+    log_message "Tor control process started"
+    
+    local tor_detected=false
+    local check_count=0
+    
+    # Step 1: check.torproject.org control
+    echo -e "${CYAN}Primary Tor check (check.torproject.org)...${NC}"
+    
+    for i in {1..3}; do
+        local response=$(curl -s --connect-timeout 10 --max-time 15 "https://check.torproject.org/api/ip" 2>/dev/null)
+        
+        if [[ $? -eq 0 && -n "$response" ]]; then
+            if echo "$response" | grep -q '"IsTor":true'; then
+                echo -e "${RED}Warning: Tor network detected! (check.torproject.org)${NC}"
+                tor_detected=true
+                break
+            fi
+        fi
+        
+        if [[ $i -lt 3 ]]; then
+            echo -e "${YELLOW}Retrying... ($((i+1))/3)${NC}"
+            sleep 2
+        fi
+    done
+    
+    # Step 2: DNS resolution control (Tor DNS leak)
+    if [[ "$tor_detected" == false ]]; then
+        echo -e "${CYAN}Secondary Tor check (DNS analysis)...${NC}"
+        
+        local dns_servers=("8.8.8.8" "1.1.1.1" "208.67.222.222")
+        local suspicious_dns=0
+        
+        for dns in "${dns_servers[@]}"; do
+            local dns_response=$(dig +short +time=5 @"$dns" check.torproject.org 2>/dev/null)
+            if [[ -z "$dns_response" ]] || [[ "$dns_response" =~ "connection timed out" ]]; then
+                ((suspicious_dns++))
+            fi
+        done
+        
+        if [[ $suspicious_dns -ge 2 ]]; then
+            echo -e "${YELLOW}Warning: Suspicious DNS behavior detected${NC}"
+            tor_detected=true
+        fi
+    fi
+    
+    # Step 3: Network interface control
+    if [[ "$tor_detected" == false ]]; then
+        echo -e "${CYAN}Tertiary Tor check (network interface analysis)...${NC}"
+        
+        # Tor-related process control
+        if pgrep -x "tor" > /dev/null 2>&1; then
+            echo -e "${YELLOW}Warning: Tor process is active${NC}"
+            
+            # Tor port control
+            if netstat -tlnp 2>/dev/null | grep -E ":(9050|9051|9150)" | grep -q "tor"; then
+                echo -e "${RED}Warning: Active Tor connection ports detected${NC}"
+                tor_detected=true
+            fi
+        fi
+        
+        # Tun/tap interface control (VPN/Tor combination)
+        if ip link show 2>/dev/null | grep -E "(tun|tap)" | grep -q "state UP"; then
+            echo -e "${YELLOW}Warning: VPN/Anonymization interface detected${NC}"
+            # Conservative approach in this case
+        fi
+    fi
+    
+    # Step 4: IP geolocation control
+    if [[ "$tor_detected" == false ]]; then
+        echo -e "${CYAN}Quaternary Tor check (IP geolocation)...${NC}"
+        
+        local public_ip=$(curl -s --connect-timeout 5 --max-time 10 "https://ipinfo.io/ip" 2>/dev/null)
+        
+        if [[ -n "$public_ip" ]]; then
+            # Check known Tor exit node lists
+            local tor_check=$(curl -s --connect-timeout 5 --max-time 10 "https://check.torproject.org/torbulkexitlist?ip=$public_ip" 2>/dev/null)
+            
+            if [[ -n "$tor_check" && "$tor_check" =~ "$public_ip" ]]; then
+                echo -e "${RED}Warning: IP address found in Tor exit node list!${NC}"
+                tor_detected=true
+            fi
+        fi
+    fi
+    
+    # Result evaluation
+    if [[ "$tor_detected" == true ]]; then
+        echo ""
+        echo -e "${RED}TOR TRAFFIC DETECTED!${NC}"
+        echo -e "${RED}===========================================${NC}"
+        echo -e "${WHITE}OpenMammoth Firewall disabled for security reasons.${NC}"
+        echo -e "${YELLOW}Please close Tor connection and try again.${NC}"
+        echo ""
+        log_message "Tor traffic detected - Firewall disabled"
+        exit 1
+    else
+        echo -e "${GREEN}No Tor traffic detected. Proceeding safely...${NC}"
+        log_message "Tor check passed - Normal traffic detected"
+        sleep 1
+    fi
+}
+
+# iptables rules net protection
+enable_firewall() {
+    echo -e "${CYAN}Activating OpenMammoth Firewall ...${NC}"
+    log_message "Firewall activation process started"
+    
+    # Clear existing rules
+    echo -e "${YELLOW}Clearing existing iptables rules...${NC}"
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -t raw -F
+    iptables -t raw -X
+    
+    # Default policies
+    echo -e "${YELLOW}Setting default security policies...${NC}"
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT ACCEPT
+    
+    # Allow loopback traffic
+    echo -e "${YELLOW}Configuring loopback traffic...${NC}"
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+    
+    # Accept established connections
+    echo -e "${YELLOW}Protecting existing connections...${NC}"
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    
+    # Advanced ICMP protection (limited ping responses)
+    echo -e "${YELLOW}Configuring ICMP traffic protection...${NC}"
+    iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/s --limit-burst 10 -j ACCEPT
+    iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+    iptables -A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
+    iptables -A INPUT -p icmp --icmp-type time-exceeded -j ACCEPT
+    # Drop dangerous ICMP types
+    iptables -A INPUT -p icmp --icmp-type address-mask-request -j DROP
+    iptables -A INPUT -p icmp --icmp-type timestamp-request -j DROP
+    iptables -A INPUT -p icmp --icmp-type redirect -j DROP
+    iptables -A OUTPUT -p icmp --icmp-type echo-reply -j DROP
+    # Drop large ICMP packets (Ping of Death protection)
+    iptables -A INPUT -p icmp --icmp-type echo-request -m length --length 1000:65535 -j DROP
+    
+    # Enhanced SSH security (port 22)
+    echo -e "${YELLOW}Applying enhanced SSH security rules...${NC}"
+    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name ssh_attack --rsource
+    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 --name ssh_attack --rsource -j DROP
+    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
+    
+    # HTTP/HTTPS outbound traffic
+    echo -e "${YELLOW}Configuring web traffic...${NC}"
+    iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+    
+    # DNS outbound traffic with protection
+    echo -e "${YELLOW}Configuring DNS traffic...${NC}"
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+    # Protect against DNS amplification attacks
+    iptables -A INPUT -p udp --dport 53 -m string --algo bm --string "any" -j DROP
+    iptables -A INPUT -p udp --dport 53 -m string --algo bm --string "ANY" -j DROP
+    
+    # NTP outbound traffic
+    echo -e "${YELLOW}Configuring NTP traffic...${NC}"
+    iptables -A OUTPUT -p udp --dport 123 -j ACCEPT
+    
+    # Advanced attack protection - Enhanced SYN flood protection
+    echo -e "${YELLOW}Activating enhanced SYN flood protection...${NC}"
+    iptables -A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL FIN,URG,PSH -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -j DROP
+    iptables -A INPUT -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+    iptables -A INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+    iptables -A INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+    
+    # Advanced mangle table protections
+    echo -e "${YELLOW}Applying mangle table security rules...${NC}"
+    iptables -t mangle -A PREROUTING -p tcp ! --syn -m state --state NEW -j DROP
+    iptables -t mangle -A PREROUTING -m conntrack --ctstate INVALID -j DROP
+    iptables -t mangle -A PREROUTING -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+    iptables -t mangle -A PREROUTING -p tcp -m conntrack --ctstate NEW -m tcpmss ! --mss 536:65535 -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG NONE -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags FIN,SYN FIN,SYN -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags FIN,ACK FIN -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags ACK,URG URG -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags ACK,FIN FIN -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags ACK,PSH PSH -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags ALL ALL -j DROP
+    iptables -t mangle -A PREROUTING -p tcp --tcp-flags ALL NONE -j DROP
+    iptables -t mangle -A PREROUTING -f -j DROP
+    
+    # Advanced port scan protection with logging
+    echo -e "${YELLOW}Activating advanced port scan protection...${NC}"
+    if [[ "$FIREWALL_LOG_ENABLED" == true ]]; then
+        iptables -A INPUT -m recent --name portscan --set -j LOG --log-prefix "OM-FW-PORTSCAN: "
+        iptables -A FORWARD -m recent --name portscan --set -j LOG --log-prefix "OM-FW-PORTSCAN: "
+    fi
+    iptables -A INPUT -m recent --name portscan --rcheck --seconds 86400 -j DROP
+    iptables -A FORWARD -m recent --name portscan --rcheck --seconds 86400 -j DROP
+    iptables -A INPUT -m recent --name portscan --remove
+    iptables -A FORWARD -m recent --name portscan --remove
+    
+    # Enhanced connection rate limiting
+    echo -e "${YELLOW}Applying enhanced connection rate limits...${NC}"
+    iptables -A INPUT -p tcp -m connlimit --connlimit-above 50 -j REJECT --reject-with tcp-reset
+    iptables -A INPUT -p tcp --syn -m limit --limit 10/sec --limit-burst 20 -j ACCEPT
+    iptables -A INPUT -p tcp --syn -j DROP
+    iptables -A INPUT -p tcp -m state --state NEW -m limit --limit 50/second --limit-burst 50 -j ACCEPT
+    # Hash-based SYN limiting
+    iptables -A INPUT -p tcp --syn -m hashlimit --hashlimit 10/sec --hashlimit-burst 20 --hashlimit-mode srcip --hashlimit-name syn_flood -j ACCEPT
+    iptables -A INPUT -p tcp --syn -m connlimit --connlimit-above 100 --connlimit-mask 24 -j DROP
+    
+    # Advanced malicious packet protection  
+    echo -e "${YELLOW}Activating advanced malicious packet protection...${NC}"
+    iptables -A INPUT -p tcp --tcp-flags ACK,FIN FIN -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ACK,PSH PSH -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ACK,URG URG -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL FIN -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL FIN,PSH,URG -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL URG,PSH,FIN -j DROP
+    iptables -A INPUT -p tcp --tcp-flags ALL URG,PSH,SYN,FIN -j DROP
+    iptables -A INPUT -p tcp --tcp-flags SYN,ACK SYN,ACK -m state --state NEW -j DROP
+    
+    # Enhanced fragmented packet protection
+    echo -e "${YELLOW}Activating enhanced fragmentation protection...${NC}"
+    iptables -A INPUT -f -m limit --limit 100/sec --limit-burst 100 -j ACCEPT
+    iptables -A INPUT -f -j DROP
+    
+    # Block private and reserved IP ranges (anti-spoofing)
+    echo -e "${YELLOW}Blocking private and reserved IP ranges...${NC}"
+    iptables -A INPUT -s 10.0.0.0/8 -j DROP
+    iptables -A INPUT -s 169.254.0.0/16 -j DROP  
+    iptables -A INPUT -s 172.16.0.0/12 -j DROP
+    iptables -A INPUT -s 240.0.0.0/5 -j DROP
+    iptables -A INPUT -s 0.0.0.0/8 -j DROP
+    iptables -A INPUT -s 127.0.0.0/8 -j DROP
+    iptables -A OUTPUT -s 169.254.0.0/16 -j DROP
+    iptables -A OUTPUT -s 127.0.0.0/8 -j DROP
+    
+    # Block multicast and broadcast addresses
+    echo -e "${YELLOW}Blocking multicast and broadcast traffic...${NC}"
+    iptables -A INPUT -m pkttype --pkt-type broadcast -j DROP
+    iptables -A INPUT -m pkttype --pkt-type multicast -j DROP
+    iptables -A INPUT -d 224.0.0.0/4 -j DROP
+    iptables -A INPUT -d 240.0.0.0/5 -j DROP
+    iptables -A INPUT -d 239.255.255.0/24 -j DROP
+    iptables -A INPUT -d 255.255.255.255 -j DROP
+    iptables -A OUTPUT -d 224.0.0.0/4 -j DROP
+    iptables -A OUTPUT -d 240.0.0.0/5 -j DROP
+    iptables -A OUTPUT -d 239.255.255.0/24 -j DROP
+    iptables -A OUTPUT -d 255.255.255.255 -j DROP
+    
+    # Enhanced invalid packet protection with logging
+    echo -e "${YELLOW}Activating enhanced invalid packet protection...${NC}"
+    if [[ "$FIREWALL_LOG_ENABLED" == true ]]; then
+        iptables -A INPUT -m conntrack --ctstate INVALID -j LOG --log-prefix "OM-FW-INVALID: "
+    fi
+    iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+    iptables -A FORWARD -m conntrack --ctstate INVALID -j DROP
+    iptables -A OUTPUT -m conntrack --ctstate INVALID -j DROP
+    
+    # Advanced UDP protection
+    echo -e "${YELLOW}Applying advanced UDP protection...${NC}"
+    iptables -A INPUT -p udp -m limit --limit 10/sec --limit-burst 20 -j ACCEPT
+    iptables -A INPUT -p udp -j DROP
+    
+    # HTTP/HTTPS connection limiting
+    echo -e "${YELLOW}Applying HTTP/HTTPS connection limits...${NC}"
+    iptables -A INPUT -p tcp --dport 80 -m connlimit --connlimit-above 50 --connlimit-mask 32 -j DROP
+    iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 10 --connlimit-mask 32 -j DROP
+    iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 20 --connlimit-mask 32 -j REJECT
+    
+    # RST packet limiting (anti-Smurf)
+    echo -e "${YELLOW}Applying RST packet rate limiting...${NC}"
+    iptables -A INPUT -p tcp --tcp-flags RST RST -m limit --limit 2/second --limit-burst 2 -j ACCEPT
+    
+    # TCP MSS clamping to prevent fragmentation
+    echo -e "${YELLOW}Configuring TCP MSS clamping...${NC}"
+    iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    
+    # Log suspicious activities (if logging enabled)
+    if [[ "$FIREWALL_LOG_ENABLED" == true ]]; then
+        echo -e "${YELLOW}Activating suspicious activity logging...${NC}"
+        iptables -A INPUT -j LOG --log-prefix "OM-FW-DROPPED: " --log-level 4 -m limit --limit 5/min
+    fi
+    
+    # Save rules
+    echo -e "${YELLOW}Saving firewall rules...${NC}"
+    if command -v iptables-save > /dev/null 2>&1; then
+        # Create iptables directory if it doesn't exist
+        mkdir -p /etc/iptables 2>/dev/null
+        
+        # Try multiple locations for saving rules
+        if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+            echo -e "${GREEN}Rules saved to /etc/iptables/rules.v4${NC}"
+        elif iptables-save > /etc/iptables/rules 2>/dev/null; then
+            echo -e "${GREEN}Rules saved to /etc/iptables/rules${NC}"
+        elif iptables-save > /var/lib/iptables/rules-save 2>/dev/null; then
+            echo -e "${GREEN}Rules saved to /var/lib/iptables/rules-save${NC}"
+        else
+            echo -e "${YELLOW}Warning: Could not save rules to standard locations${NC}"
+            echo -e "${YELLOW}Rules are active but may not persist after reboot${NC}"
+        fi
+    else
+        echo -e "${YELLOW}iptables-save not available, rules not saved${NC}"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}OpenMammoth Firewall successfully activated!${NC}"
+    echo -e "${GREEN}=================================================${NC}"
+    echo -e "${WHITE}System is now protected with advanced security rules.${NC}"
+    echo -e "${WHITE}Internet connection preserved during protection.${NC}"
+    log_message "OpenMammoth Firewall successfully activated"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Disable firewall
+disable_firewall() {
+    echo -e "${YELLOW}Disabling OpenMammoth Firewall...${NC}"
+    log_message "Firewall disable process started"
+    
+    # Clear all rules
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -t raw -F
+    iptables -t raw -X
+    
+    # Set default policies to ACCEPT
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    
+    echo ""
+    echo -e "${GREEN}OpenMammoth Firewall disabled!${NC}"
+    echo -e "${YELLOW}Warning: System now running without firewall protection.${NC}"
+    log_message "OpenMammoth Firewall disabled"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Firewall status check
+check_status() {
+    echo -e "${CYAN}Checking OpenMammoth Firewall status...${NC}"
+    log_message "Firewall status check performed"
+    
+    local rule_count=$(iptables -L | wc -l)
+    local input_policy=$(iptables -L INPUT | head -1 | grep -o "policy [A-Z]*" | cut -d' ' -f2)
+    
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║                    FIREWALL STATUS REPORT                        ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    if [[ $rule_count -gt 30 ]] && [[ "$input_policy" == "DROP" ]]; then
+        echo -e "${GREEN}Status: ACTIVE${NC}"
+        echo -e "${WHITE}OpenMammoth Firewall is running${NC}"
+        echo -e "${WHITE}Active rule count: ${GREEN}$rule_count${NC}"
+        echo -e "${WHITE}Input policy: ${GREEN}$input_policy (Secure)${NC}"
+        
+        # Important rule checks
+        local syn_protection=$(iptables -L INPUT | grep -c "tcp-flags")
+        local rate_limiting=$(iptables -L INPUT | grep -c "limit")
+        local mangle_rules=$(iptables -t mangle -L | grep -c "target")
+        local spoofing_protection=0
+        
+        if [[ -f "/proc/sys/net/ipv4/conf/all/rp_filter" ]]; then
+            local rp_filter=$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)
+            if [[ "$rp_filter" == "1" ]]; then
+                spoofing_protection=1
+            fi
+        fi
+        
+        echo ""
+        echo -e "${CYAN}Active Security Features:${NC}"
+        echo -e "${WHITE}   ├─ SYN flood protection: ${GREEN}$([ $syn_protection -gt 0 ] && echo "Active ($syn_protection rules)" || echo "Inactive")${NC}"
+        echo -e "${WHITE}   ├─ Rate limiting: ${GREEN}$([ $rate_limiting -gt 0 ] && echo "Active ($rate_limiting rules)" || echo "Inactive")${NC}"
+        echo -e "${WHITE}   ├─ Mangle table rules: ${GREEN}$([ $mangle_rules -gt 0 ] && echo "Active ($mangle_rules rules)" || echo "Inactive")${NC}"
+        echo -e "${WHITE}   ├─ Connection tracking: ${GREEN}Active${NC}"
+        echo -e "${WHITE}   ├─ Logging: ${GREEN}$([ "$FIREWALL_LOG_ENABLED" == true ] && echo "Enabled" || echo "Disabled")${NC}"
+        echo -e "${WHITE}   └─ Advanced protections: ${GREEN}Active${NC}"
+        
+    else
+        echo -e "${RED}Status: INACTIVE${NC}"
+        echo -e "${WHITE}OpenMammoth Firewall is not running${NC}"
+        echo -e "${WHITE}Active rule count: ${RED}$rule_count${NC}"
+        echo -e "${WHITE}Input policy: ${RED}$input_policy (Insecure)${NC}"
+        echo ""
+        echo -e "${YELLOW}Warning: System running without firewall protection!${NC}"
+    fi
+    
+    # Last activity information
+    if [[ -f "$LOG_FILE" ]]; then
+        local last_action=$(tail -1 "$LOG_FILE" 2>/dev/null)
+        if [[ -n "$last_action" ]]; then
+            echo ""
+            echo -e "${CYAN}Last operation: ${WHITE}$last_action${NC}"
+        fi
+    fi
+    
+    # System resource usage
+    local memory_usage=$(free | grep Mem | awk '{printf "%.1f", ($3/$2)*100}')
+    local cpu_load=$(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1 | xargs)
+    
+    echo ""
+    echo -e "${BLUE}System Status:${NC}"
+    echo -e "${WHITE}   ├─ Memory usage: ${memory_usage}%${NC}"
+    echo -e "${WHITE}   └─ CPU load: ${cpu_load}${NC}"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Main menu
+show_menu() {
+    while true; do
+        show_banner
+        
+        echo -e "${WHITE}╔════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${WHITE}║                            MAIN MENU                               ║${NC}"
+        echo -e "${WHITE}╚════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${GREEN}1.${NC} ${WHITE}Enable O.M. Firewall       ${GREEN}│${NC} ${CYAN}Activate firewall protection${NC}"
+        echo -e "${RED}2.${NC} ${WHITE}Disable O.M Firewall       ${RED}│${NC} ${CYAN}Deactivate firewall${NC}"
+        echo -e "${BLUE}3.${NC} ${WHITE}Status O.M Firewall        ${BLUE}│${NC} ${CYAN}View status and statistics${NC}"
+        echo -e "${PURPLE}4.${NC} ${WHITE}Enable Firewall Logs       ${PURPLE}│${NC} ${CYAN}Enable detailed logging${NC}"
+        echo -e "${PURPLE}5.${NC} ${WHITE}Disable Firewall Logs      ${PURPLE}│${NC} ${CYAN}Disable logging${NC}"
+        echo -e "${YELLOW}6.${NC} ${WHITE}Exit                       ${YELLOW}│${NC} ${CYAN}Exit program${NC}"
+        echo ""
+        echo -e "${WHITE}╔════════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${WHITE}║ ${CYAN}Note: Firewall preserves internet connection while protecting!${WHITE}║${NC}"
+        echo -e "${WHITE}╚════════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        
+        read -p "$(echo -e ${WHITE}"Select your choice [1-6]: "${NC})" choice
+        
+        case $choice in
+            1)
+                enable_firewall
+                ;;
+            2)
+                disable_firewall
+                ;;
+            3)
+                check_status
+                ;;
+            4)
+                enable_firewall_logs
+                ;;
+            5)
+                disable_firewall_logs
+                ;;
+            6)
+                echo ""
+                echo -e "${PURPLE}Exiting OpenMammoth Firewall ...${NC}"
+                echo -e "${WHITE}Stay secure! System protection continues.${NC}"
+                log_message "OpenMammoth Firewall closed"
+                exit 0
+                ;;
+            *)
+                echo ""
+                echo -e "${RED}Invalid selection! Please enter a number between 1-6.${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+# Main script initialization
+main() {
+    # Root check
+    check_root
+    
+    # Create log file
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/openmammoth-firewall.log"
+    
+    log_message "OpenMammoth Firewall started"
+    
+    # Perform Tor check
+    check_tor_usage
+    
+    # Show main menu
+    show_menu
+}
+
+# Run script
+main "$@"
